@@ -45,7 +45,7 @@ class VesicleArgs:
     radii_nm_list: list[float] | None = None
     periodic_boundary_xyz: tuple[bool, bool, bool] = (True, True, True)
     placement_max_failures: int = 10000
-    collision_buffer_sigma_multiplier: float = 6.0
+    collision_buffer_sigma_multiplier: float = 30.0
     D_out_nm: float = 2.26
     sigma_nm: float = 0.22
 
@@ -67,6 +67,7 @@ class VesicleArgs:
 
     # Output naming
     result_path: Path = field(default_factory=lambda: Path("results"))
+    vdb_folder: Path | None = None
     filename: str = "vesicle"
     filename_tags: str = ""
     filename_suffix: str = ""
@@ -87,6 +88,9 @@ class VesicleArgs:
 
     # Results payload controls
     save_data_in_results: bool = False
+    save_remeshed_data_in_results: bool = True
+    save_model_plots_in_results: bool = True
+    compute_polarized_traces: bool = True
     save_args_in_results: bool = True
     save_pickle_in_run: bool = True
     return_I_para_perp: bool = True
@@ -95,6 +99,10 @@ class VesicleArgs:
         self.validate()
 
     def validate(self) -> None:
+        self.result_path = Path(self.result_path)
+        if self.vdb_folder is not None:
+            self.vdb_folder = Path(self.vdb_folder)
+
         if len(self.periodic_boundary_xyz) != 3:
             raise ValueError("periodic_boundary_xyz must have exactly 3 elements")
         self.periodic_boundary_xyz = tuple(bool(v) for v in self.periodic_boundary_xyz)

@@ -37,6 +37,7 @@ def _multiple_base_args():
     args.backend = "numpy"
     args.vfrac_supersample = 1
     args.periodic_boundary_xyz = (True, True, True)
+    args.placement_max_failures = 200
     return args
 
 
@@ -54,6 +55,7 @@ def test_list_mode_length_drives_num_vesicles_and_preserves_original_order():
 
     assert args.num_vesicles == 3
     assert fields["num_vesicles_requested"] == 3
+    assert fields["num_vesicles_generated"] == 3
     assert fields["num_vesicles_placed"] == 3
     assert np.allclose(fields["accepted_radii_nm"], np.array([9.0, 5.0, 7.0], dtype=np.float32))
     assert fields["accepted_centers_nm"].shape == (3, 3)
@@ -98,6 +100,67 @@ def test_constant_sampling_is_seed_deterministic_for_radii_and_centers():
     assert np.allclose(fields_a["accepted_centers_nm"], fields_b["accepted_centers_nm"])
 
 
+def test_first_placed_vesicle_is_at_box_center():
+    args = _multiple_base_args()
+    args.vd = 40
+    args.ld = 24
+    args.PhysSize = 1.5
+    args.num_vesicles = 3
+    args.radius_nm = 6.0
+    args.base_seed = 101
+
+    fields = generate_vesicle_fields(args)
+    expected_center = np.array(
+        [0.5 * args.vd * args.PhysSize, 0.5 * args.ld * args.PhysSize, 0.5 * args.ld * args.PhysSize],
+        dtype=np.float32,
+    )
+    assert np.allclose(fields["accepted_centers_nm"][0], expected_center, atol=1e-6)
+
+
+def test_constant_sampling_prefix_stability_across_num_vesicles():
+    args_two = _multiple_base_args()
+    args_two.vd = 32
+    args_two.ld = 32
+    args_two.PhysSize = 1.5
+    args_two.radius_nm = 7.0
+    args_two.base_seed = 29
+    args_two.num_vesicles = 2
+
+    args_three = copy.deepcopy(args_two)
+    args_three.num_vesicles = 3
+
+    fields_two = generate_vesicle_fields(args_two)
+    fields_three = generate_vesicle_fields(args_three)
+
+    n_two = fields_two["accepted_radii_nm"].shape[0]
+    assert fields_three["accepted_radii_nm"].shape[0] >= n_two
+    assert np.allclose(fields_two["accepted_radii_nm"], fields_three["accepted_radii_nm"][:n_two], atol=1e-6)
+    assert np.allclose(fields_two["accepted_centers_nm"], fields_three["accepted_centers_nm"][:n_two], atol=1e-6)
+
+
+def test_normal_sampling_prefix_stability_across_num_vesicles():
+    args_two = _multiple_base_args()
+    args_two.vd = 60
+    args_two.ld = 60
+    args_two.PhysSize = 2.0
+    args_two.radius_sampling_mode = RadiusSamplingMode.NORMAL
+    args_two.radius_nm = 20.0
+    args_two.radius_sigma_nm = 2.0
+    args_two.base_seed = 9
+    args_two.num_vesicles = 2
+
+    args_three = copy.deepcopy(args_two)
+    args_three.num_vesicles = 3
+
+    fields_two = generate_vesicle_fields(args_two)
+    fields_three = generate_vesicle_fields(args_three)
+
+    n_two = fields_two["accepted_radii_nm"].shape[0]
+    assert fields_three["accepted_radii_nm"].shape[0] >= n_two
+    assert np.allclose(fields_two["accepted_radii_nm"], fields_three["accepted_radii_nm"][:n_two], atol=1e-6)
+    assert np.allclose(fields_two["accepted_centers_nm"], fields_three["accepted_centers_nm"][:n_two], atol=1e-6)
+
+
 def test_collision_logic_uses_periodic_minimum_image_metric():
     args = _multiple_base_args()
     args.sigma_nm = 0.22
@@ -132,10 +195,12 @@ def test_partial_placement_hits_consecutive_failure_threshold_and_reports(capsys
     captured = capsys.readouterr().out
 
     assert fields["num_vesicles_requested"] == 3
+    assert fields["num_vesicles_generated"] == 1
     assert fields["num_vesicles_placed"] == 1
     assert fields["consecutive_failures_final"] == 5
     assert fields["accepted_centers_nm"].shape == (1, 3)
     assert "num_vesicles_requested=3" in captured
+    assert "num_vesicles_generated=1" in captured
     assert "num_vesicles_placed=1" in captured
 
 
@@ -169,7 +234,8 @@ def test_consecutive_failure_counter_resets_after_success():
     )
     placement = _place_vesicles(args=args, radii_nm=radii, rng=stub_rng, box_lengths_nm=box_lengths)
 
-    assert placement["num_vesicles_placed"] == 2
+    assert placement["num_vesicles_generated"] == 2
+    assert placement["accepted_radii_nm_all"].shape == (2,)
     assert placement["consecutive_failures_final"] == 0
 
 
@@ -185,7 +251,10 @@ def test_masked_addition_and_euler_defaults_outside_support():
 
     fields = generate_vesicle_fields(args)
     center_nm = fields["accepted_centers_nm"][0]
-    support_nm = fields["accepted_radii_nm"][0] + 3.0 * args.sigma_nm
+    support_nm = (
+        fields["accepted_radii_nm"][0]
+        + 0.5 * args.collision_buffer_sigma_multiplier * args.sigma_nm
+    )
 
     distance_nm = _minimum_image_distances_nm(args, center_nm=center_nm)
     outside_mask = distance_nm > (support_nm + 1e-6)

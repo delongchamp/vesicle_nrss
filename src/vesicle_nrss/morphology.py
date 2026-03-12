@@ -96,6 +96,7 @@ def _generate_single_vesicle_fields(args: VesicleArgs, xp, erf_func) -> dict[str
         "accepted_radii_nm": np.array([args.radius_nm], dtype=np.float32),
         "accepted_centers_nm": _single_mode_center_nm(args)[None, :],
         "num_vesicles_requested": 1,
+        "num_vesicles_generated": 1,
         "num_vesicles_placed": 1,
         "consecutive_failures_final": 0,
         "placement_max_failures": args.placement_max_failures,
@@ -113,24 +114,6 @@ def _signed_minimum_image_delta_nm(delta_nm, box_len_nm: float, periodic: bool):
     if periodic:
         return ((delta_nm + 0.5 * box_len_nm) % box_len_nm) - 0.5 * box_len_nm
     return delta_nm
-
-
-def _resolve_radius_list_nm(args: VesicleArgs, rng: np.random.Generator) -> np.ndarray:
-    if args.radius_sampling_mode is RadiusSamplingMode.CONSTANT:
-        return np.full(args.num_vesicles, args.radius_nm, dtype=np.float64)
-
-    if args.radius_sampling_mode is RadiusSamplingMode.NORMAL:
-        sigma = float(args.radius_sigma_nm)
-        lower = max(10.0, args.radius_nm - 3.0 * sigma)
-        upper = args.radius_nm + 3.0 * sigma
-        a = (lower - args.radius_nm) / sigma
-        b = (upper - args.radius_nm) / sigma
-        return truncnorm(a, b, loc=args.radius_nm, scale=sigma).rvs(size=args.num_vesicles, random_state=rng)
-
-    if args.radius_sampling_mode is RadiusSamplingMode.LIST:
-        return np.asarray(args.radii_nm_list, dtype=np.float64)
-
-    raise ValueError(f"Unsupported radius_sampling_mode: {args.radius_sampling_mode}")
 
 
 def _candidate_collides(
@@ -156,83 +139,102 @@ def _candidate_collides(
 
 def _place_vesicles(
     args: VesicleArgs,
-    radii_nm: np.ndarray,
     rng: np.random.Generator,
     box_lengths_nm: np.ndarray,
+    radii_nm: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    requested = int(len(radii_nm))
-    accepted_orig_idx: list[int] = []
+    finite_radii = None
+    if radii_nm is not None:
+        finite_radii = np.asarray(radii_nm, dtype=np.float64)
+    elif args.radius_sampling_mode is RadiusSamplingMode.LIST:
+        finite_radii = np.asarray(args.radii_nm_list, dtype=np.float64)
+
+    truncated_normal = None
+    if finite_radii is None and args.radius_sampling_mode is RadiusSamplingMode.NORMAL:
+        sigma = float(args.radius_sigma_nm)
+        lower = max(10.0, args.radius_nm - 3.0 * sigma)
+        upper = args.radius_nm + 3.0 * sigma
+        a = (lower - args.radius_nm) / sigma
+        b = (upper - args.radius_nm) / sigma
+        truncated_normal = truncnorm(a, b, loc=args.radius_nm, scale=sigma)
+
     accepted_radii: list[float] = []
     accepted_centers: list[np.ndarray] = []
-
-    placement_order = np.argsort(-radii_nm, kind="stable")
     target_ptr = 0
     consecutive_failures = 0
+    while consecutive_failures < args.placement_max_failures:
+        if finite_radii is not None:
+            if target_ptr >= finite_radii.size:
+                break
+            target_radius = float(finite_radii[target_ptr])
+        elif args.radius_sampling_mode is RadiusSamplingMode.CONSTANT:
+            target_radius = float(args.radius_nm)
+        elif args.radius_sampling_mode is RadiusSamplingMode.NORMAL:
+            target_radius = float(truncated_normal.rvs(size=1, random_state=rng)[0])
+        else:
+            raise ValueError(f"Unsupported radius_sampling_mode: {args.radius_sampling_mode}")
 
-    while target_ptr < requested and consecutive_failures < args.placement_max_failures:
-        orig_idx = int(placement_order[target_ptr])
-        candidate_radius = float(radii_nm[orig_idx])
-        candidate_center = np.array(
-            [
-                rng.uniform(0.0, box_lengths_nm[0]),
-                rng.uniform(0.0, box_lengths_nm[1]),
-                rng.uniform(0.0, box_lengths_nm[2]),
-            ],
-            dtype=np.float64,
-        )
+        target_accepted = False
+        while consecutive_failures < args.placement_max_failures:
+            if target_ptr == 0 and not accepted_centers:
+                candidate_center = 0.5 * box_lengths_nm
+            else:
+                candidate_center = np.array(
+                    [
+                        rng.uniform(0.0, box_lengths_nm[0]),
+                        rng.uniform(0.0, box_lengths_nm[1]),
+                        rng.uniform(0.0, box_lengths_nm[2]),
+                    ],
+                    dtype=np.float64,
+                )
 
-        accepted_centers_array = (
-            np.asarray(accepted_centers, dtype=np.float64).reshape(-1, 3)
-            if accepted_centers
-            else np.empty((0, 3), dtype=np.float64)
-        )
-        accepted_radii_array = (
-            np.asarray(accepted_radii, dtype=np.float64)
-            if accepted_radii
-            else np.empty((0,), dtype=np.float64)
-        )
+            accepted_centers_array = (
+                np.asarray(accepted_centers, dtype=np.float64).reshape(-1, 3)
+                if accepted_centers
+                else np.empty((0, 3), dtype=np.float64)
+            )
+            accepted_radii_array = (
+                np.asarray(accepted_radii, dtype=np.float64)
+                if accepted_radii
+                else np.empty((0,), dtype=np.float64)
+            )
 
-        if _candidate_collides(
-            candidate_center_nm=candidate_center,
-            candidate_radius_nm=candidate_radius,
-            accepted_centers_nm=accepted_centers_array,
-            accepted_radii_nm=accepted_radii_array,
-            args=args,
-            box_lengths_nm=box_lengths_nm,
-        ):
-            consecutive_failures += 1
-            continue
+            if _candidate_collides(
+                candidate_center_nm=candidate_center,
+                candidate_radius_nm=target_radius,
+                accepted_centers_nm=accepted_centers_array,
+                accepted_radii_nm=accepted_radii_array,
+                args=args,
+                box_lengths_nm=box_lengths_nm,
+            ):
+                consecutive_failures += 1
+                continue
 
-        accepted_orig_idx.append(orig_idx)
-        accepted_radii.append(candidate_radius)
-        accepted_centers.append(candidate_center)
-        target_ptr += 1
-        consecutive_failures = 0
+            accepted_radii.append(target_radius)
+            accepted_centers.append(candidate_center)
+            target_ptr += 1
+            consecutive_failures = 0
+            target_accepted = True
+            break
 
-    if accepted_orig_idx:
-        order = np.argsort(np.asarray(accepted_orig_idx), kind="stable")
-        accepted_orig = np.asarray(accepted_orig_idx, dtype=np.int64)[order]
-        accepted_radii_nm = np.asarray(accepted_radii, dtype=np.float64)[order]
-        accepted_centers_nm = np.asarray(accepted_centers, dtype=np.float64)[order]
-    else:
-        accepted_orig = np.empty((0,), dtype=np.int64)
-        accepted_radii_nm = np.empty((0,), dtype=np.float64)
-        accepted_centers_nm = np.empty((0, 3), dtype=np.float64)
+        if not target_accepted and consecutive_failures >= args.placement_max_failures:
+            break
 
-    print(
-        "[vesicle_nrss] placement_summary "
-        f"num_vesicles_requested={requested} "
-        f"num_vesicles_placed={accepted_radii_nm.size} "
-        f"consecutive_failures_final={consecutive_failures} "
-        f"placement_max_failures={args.placement_max_failures}"
+    accepted_radii_nm = (
+        np.asarray(accepted_radii, dtype=np.float64)
+        if accepted_radii
+        else np.empty((0,), dtype=np.float64)
+    )
+    accepted_centers_nm = (
+        np.asarray(accepted_centers, dtype=np.float64)
+        if accepted_centers
+        else np.empty((0, 3), dtype=np.float64)
     )
 
     return {
-        "accepted_orig_indices": accepted_orig,
-        "accepted_radii_nm": accepted_radii_nm.astype(np.float32),
-        "accepted_centers_nm": accepted_centers_nm.astype(np.float32),
-        "num_vesicles_requested": requested,
-        "num_vesicles_placed": int(accepted_radii_nm.size),
+        "accepted_radii_nm_all": accepted_radii_nm.astype(np.float32),
+        "accepted_centers_nm_all": accepted_centers_nm.astype(np.float32),
+        "num_vesicles_generated": int(accepted_radii_nm.size),
         "consecutive_failures_final": int(consecutive_failures),
         "placement_max_failures": int(args.placement_max_failures),
     }
@@ -260,17 +262,30 @@ def _generate_multiple_vesicle_fields(args: VesicleArgs, xp, erf_func) -> dict[s
 
     rng = np.random.default_rng(args.base_seed)
     box_lengths_nm = _box_lengths_nm(args)
-    sampled_radii_nm = _resolve_radius_list_nm(args, rng=rng)
     placement = _place_vesicles(
         args=args,
-        radii_nm=sampled_radii_nm,
         rng=rng,
         box_lengths_nm=box_lengths_nm,
     )
 
-    placed_radii_nm = placement["accepted_radii_nm"]
-    placed_centers_nm = placement["accepted_centers_nm"]
+    generated_radii_nm = placement["accepted_radii_nm_all"]
+    generated_centers_nm = placement["accepted_centers_nm_all"]
+    requested_count = int(args.num_vesicles)
+    generated_count = int(placement["num_vesicles_generated"])
+    placed_count = min(requested_count, generated_count)
+
+    placed_radii_nm = generated_radii_nm[:placed_count]
+    placed_centers_nm = generated_centers_nm[:placed_count]
     m = int(args.vfrac_supersample)
+
+    print(
+        "[vesicle_nrss] placement_summary "
+        f"num_vesicles_requested={requested_count} "
+        f"num_vesicles_generated={generated_count} "
+        f"num_vesicles_placed={placed_count} "
+        f"consecutive_failures_final={placement['consecutive_failures_final']} "
+        f"placement_max_failures={args.placement_max_failures}"
+    )
 
     vfrac_lipid_total = xp.zeros((args.vd, args.ld, args.ld), dtype=xp.float32)
     theta_total = xp.zeros((args.vd, args.ld, args.ld), dtype=xp.float32)
@@ -279,10 +294,11 @@ def _generate_multiple_vesicle_fields(args: VesicleArgs, xp, erf_func) -> dict[s
     sub_offsets = ((xp.arange(m, dtype=xp.float32) + 0.5) / m).astype(xp.float32)
     periodic_z, periodic_y, periodic_x = args.periodic_boundary_xyz
     Lz, Ly, Lx = box_lengths_nm
+    support_sigma_multiplier = 0.5 * args.collision_buffer_sigma_multiplier
 
     for radius_nm, center_nm in zip(placed_radii_nm, placed_centers_nm):
         cz_nm, cy_nm, cx_nm = [float(v) for v in center_nm]
-        support_nm = float(radius_nm + 3.0 * args.sigma_nm)
+        support_nm = float(radius_nm + support_sigma_multiplier * args.sigma_nm)
 
         z_indices = _axis_index_window(cz_nm, support_nm, args.PhysSize)
         y_indices = _axis_index_window(cy_nm, support_nm, args.PhysSize)
@@ -369,8 +385,9 @@ def _generate_multiple_vesicle_fields(args: VesicleArgs, xp, erf_func) -> dict[s
         "S_medium": S_medium,
         "accepted_radii_nm": placed_radii_nm.astype(np.float32),
         "accepted_centers_nm": placed_centers_nm.astype(np.float32),
-        "num_vesicles_requested": placement["num_vesicles_requested"],
-        "num_vesicles_placed": placement["num_vesicles_placed"],
+        "num_vesicles_requested": requested_count,
+        "num_vesicles_generated": generated_count,
+        "num_vesicles_placed": placed_count,
         "consecutive_failures_final": placement["consecutive_failures_final"],
         "placement_max_failures": placement["placement_max_failures"],
     }
@@ -446,6 +463,7 @@ def build_vesicle_morph(args: VesicleArgs):
     morph.accepted_radii_nm = np.asarray(fields["accepted_radii_nm"], dtype=np.float32)
     morph.accepted_centers_nm = np.asarray(fields["accepted_centers_nm"], dtype=np.float32)
     morph.num_vesicles_requested = int(fields["num_vesicles_requested"])
+    morph.num_vesicles_generated = int(fields["num_vesicles_generated"])
     morph.num_vesicles_placed = int(fields["num_vesicles_placed"])
     cleanup_gpu(args.backend)
     return morph

@@ -18,11 +18,14 @@ def _prepare_sweep_task(
     swept_value: Any,
     idx: int,
     base_filename: str,
+    sweep_vdb_dir: Path | None = None,
 ) -> tuple[VesicleArgs, str]:
     task_args = copy.deepcopy(base_args)
     setattr(task_args, swept_arg, swept_value)
     task_args.base_seed = int(base_args.base_seed + idx)
     task_args.filename = f"{base_filename}_{swept_arg}_{idx:03d}"
+    if sweep_vdb_dir is not None:
+        task_args.vdb_folder = sweep_vdb_dir
     output_stem = build_sweep_filename(
         filename_tags=base_args.filename_tags,
         base_filename=base_filename,
@@ -59,6 +62,10 @@ def run_vesicle_sweep(
 ):
     values = list(swept_values)
     base_filename = args.filename
+    sweep_vdb_dir = None
+    if args.vdb_folder is not None:
+        sweep_vdb_dir = Path(args.vdb_folder) / Path(args.result_path).name
+        ensure_result_path(sweep_vdb_dir)
 
     indexed_args: list[tuple[int, VesicleArgs]] = []
     indexed_stems: list[tuple[int, str]] = []
@@ -70,6 +77,7 @@ def run_vesicle_sweep(
             swept_value=value,
             idx=idx,
             base_filename=base_filename,
+            sweep_vdb_dir=sweep_vdb_dir,
         )
         indexed_args.append((idx, task_args))
         indexed_stems.append((idx, stem))
